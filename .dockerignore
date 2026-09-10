@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!chronos/
+!chronos/**
+chronos/**/__pycache__/
+chronos/**/*.pyc
