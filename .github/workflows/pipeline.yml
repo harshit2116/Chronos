@@ -1,0 +1,102 @@
+name: Chronos CI/CD
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m compileall -q chronos
+      - run: python -m chronos --scenario spacecraft --mode baseline
+      - run: node --check chronos/app.js
+
+  container:
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.34.1'
+      - name: Build and smoke test
+        run: |
+          docker build -t chronos:ci .
+          docker run -d --name chronos-ci -p 127.0.0.1:8000:8000 --read-only --tmpfs /tmp -v chronos-ci-data:/data chronos:ci
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent http://127.0.0.1:8000/healthz; then break; fi
+            sleep 1
+          done
+          curl --fail http://127.0.0.1:8000/healthz
+          curl --fail http://127.0.0.1:8000/api/state
+          kubectl kustomize deploy/k8s > /tmp/chronos-manifests.yaml
+      - name: Publish tested image
+        id: publish
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          image="ghcr.io/${REPOSITORY,,}:${GITHUB_SHA}"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
+          docker tag chronos:ci "$image"
+          docker push "$image"
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image")
+          echo "image=$digest" >> "$GITHUB_OUTPUT"
+      - name: Container logs
+        if: always()
+        run: docker logs chronos-ci || true
+
+  deploy:
+    needs: container
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.ENABLE_K8S_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: chronos-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.34.1'
+      - name: Configure cluster access
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          test -n "$KUBE_CONFIG"
+          umask 077
+          printf '%s' "$KUBE_CONFIG" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+      - name: Deploy tested image by digest
+        env:
+          IMAGE: ${{ needs.container.outputs.image }}
+        run: |
+          test -n "$IMAGE"
+          kubectl kustomize deploy/k8s | sed "s|image: chronos:local|image: $IMAGE|" > "$RUNNER_TEMP/deployment.yaml"
+          kubectl apply -f "$RUNNER_TEMP/deployment.yaml"
+          kubectl -n chronos rollout status deployment/chronos --timeout=180s
+      - name: Remove temporary credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kubeconfig"
